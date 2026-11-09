@@ -9,6 +9,9 @@ const SECTION_ID = 8730781316;
 const FROM_STATION_ID = 372825002;
 const TO_STATION_ID = 3741302011;
 const TARIFF = 'CZECH_STUDENT_PASS_26';
+const DEPARTURE_DATE = '2026-11-13';
+const FROM_LOCATION_ID = '372842000'; // město Praha (city)
+const TO_LOCATION_ID = '10202052';    // město Vídeň (city)
 
 const CLASS_NAMES: Record<string, string> = {
   C0: 'Standard',
@@ -18,8 +21,9 @@ const CLASS_NAMES: Record<string, string> = {
 };
 
 const COMMON_HEADERS = {
-  'Content-Type': 'application/json',
-  'Accept': 'application/1.2.0+json',
+  'Content-Type': 'application/1.1.0+json',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'cs,sk;q=0.9,en-US;q=0.8,en;q=0.7',
   'X-Lang': 'cs',
   'X-Currency': 'CZK',
   'X-Application-Origin': 'WEB',
@@ -63,13 +67,48 @@ function getAdjacentPairsForDeck(deckName: string): [number, number][] {
   return pairs;
 }
 
+// Rychlý check přes search endpoint — zjistí, jestli má spoj vůbec volná místa
+async function checkRouteAvailability(routeId = ROUTE_ID): Promise<{
+  bookable: boolean;
+  freeSeatsCount: number;
+  priceFrom: number;
+  found: boolean;
+}> {
+  const searchUrl =
+    `https://brn-ybus-pubapi.sa.cz/restapi/routes/search/simple` +
+    `?tariffs=${TARIFF}` +
+    `&toLocationType=CITY&toLocationId=${TO_LOCATION_ID}` +
+    `&fromLocationType=CITY&fromLocationId=${FROM_LOCATION_ID}` +
+    `&departureDate=${DEPARTURE_DATE}` +
+    `&fromLocationName=&toLocationName=`;
+
+  const res = await fetch(searchUrl, {
+    headers: COMMON_HEADERS,
+    cache: 'no-store',
+  });
+
+  if (!res.ok) return { bookable: false, freeSeatsCount: 0, priceFrom: 0, found: false };
+
+  const data = await res.json();
+  const route = (data.routes ?? []).find((r: any) => String(r.id) === routeId);
+
+  if (!route) return { bookable: false, freeSeatsCount: 0, priceFrom: 0, found: false };
+
+  return {
+    found: true,
+    bookable: route.bookable === true,
+    freeSeatsCount: route.freeSeatsCount ?? 0,
+    priceFrom: route.priceFrom ?? 0,
+  };
+}
+
 // Stažení aktuálních cen pro jednotlivé třídy
-async function fetchClassPrices(): Promise<Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }>> {
+async function fetchClassPrices(routeId = ROUTE_ID): Promise<Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }>> {
   const priceMap: Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }> = {};
 
   try {
     // 1. Zkusíme detail konkrétního spoje (vrací pole priceClasses pro každou třídu)
-    const detailUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/${ROUTE_ID}/simple?fromStationId=${FROM_STATION_ID}&toStationId=${TO_STATION_ID}&tariffs=${TARIFF}`;
+    const detailUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/${routeId}/simple?fromStationId=${FROM_STATION_ID}&toStationId=${TO_STATION_ID}&tariffs=${TARIFF}`;
     const res = await fetch(detailUrl, { headers: COMMON_HEADERS, cache: 'no-store' });
 
     if (res.ok) {
@@ -88,14 +127,14 @@ async function fetchClassPrices(): Promise<Record<string, { single: number; tota
 
     // 2. Fallback: Pokud by detail nevrátil priceClasses, vezmeme priceFrom/priceTo z vyhledávání
     if (Object.keys(priceMap).length === 0) {
-      const searchUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/search/simple?tariffs=${TARIFF}&toLocationType=CITY&toLocationId=10202052&fromLocationType=CITY&fromLocationId=372842000&departureDate=2026-11-13`;
+      const searchUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/search/simple?tariffs=${TARIFF}&toLocationType=CITY&toLocationId=${TO_LOCATION_ID}&fromLocationType=CITY&fromLocationId=${FROM_LOCATION_ID}&departureDate=${DEPARTURE_DATE}`;
       const sRes = await fetch(searchUrl, { headers: COMMON_HEADERS, cache: 'no-store' });
       if (sRes.ok) {
         const sData = await sRes.json();
-        const route = (sData.routes || []).find((r: any) => String(r.id) === ROUTE_ID);
+        const route = (sData.routes || []).find((r: any) => String(r.id) === routeId);
         if (route && route.priceFrom) {
           priceMap['FALLBACK'] = {
-            single: route.priceFrom / 1, // Původní dotaz v simple s 1 tarifem vrací cenu za 1 osobu
+            single: route.priceFrom,
             totalForTwo: route.priceFrom * 2,
             creditTotalForTwo: route.creditPriceFrom ? route.creditPriceFrom * 2 : undefined,
           };
@@ -124,11 +163,45 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const notifyAnyTwo = searchParams.get('notifyAnyTwo') === 'true';
 
+    // Volitelně přepsat spoj přes ?routeId=... (defaultně použije konstantu nahoře)
+    const effectiveRouteId = searchParams.get('routeId') ?? ROUTE_ID;
+    const effectiveSectionId = Number(effectiveRouteId);
+
+    // ── EARLY CHECK ──────────────────────────────────────────────────────────
+    // Nejdřív zjistíme přes search endpoint, jestli vůbec má spoj volná místa.
+    // Pokud ne, nevoláme zbytečně 4× /freeSeats (které by stejně vrátily "Unexpected error").
+    const availability = await checkRouteAvailability(effectiveRouteId);
+
+    if (!availability.found) {
+      return NextResponse.json({
+        ok: true,
+        checkedAt: new Date().toLocaleString('cs-CZ', { timeZone: 'Europe/Prague' }),
+        jsouMistaVedleSebe: false,
+        zprava: `⚠️ Spoj ${effectiveRouteId} nebyl nalezen v search výsledcích (špatné datum nebo ID?).`,
+        dvojiceVedleSebe: [],
+        vsechnaVolnaMistaVeVlaku: [],
+        emailStatus: 'no_need_to_send',
+      });
+    }
+
+    if (!availability.bookable || availability.freeSeatsCount === 0) {
+      return NextResponse.json({
+        ok: true,
+        checkedAt: new Date().toLocaleString('cs-CZ', { timeZone: 'Europe/Prague' }),
+        jsouMistaVedleSebe: false,
+        zprava: `❌ Spoj je plně obsazený (freeSeatsCount: ${availability.freeSeatsCount}, bookable: ${availability.bookable}). Čekám na uvolnění míst…`,
+        dvojiceVedleSebe: [],
+        vsechnaVolnaMistaVeVlaku: [],
+        emailStatus: 'no_need_to_send',
+      });
+    }
+    // ── KONEC EARLY CHECK ─────────────────────────────────────────────────────
+
     const seatClasses = ['C0', 'TRAIN_LOW_COST', 'C1', 'C2'];
 
     // Paralelně stáhneme sedadla všech 4 tříd + ceník spoje
-    const [prices, ...responses] = await Promise.all([
-      fetchClassPrices(),
+    const [prices, ...rawResponses] = await Promise.all([
+      fetchClassPrices(effectiveRouteId),
       ...seatClasses.map((seatClass) =>
         fetch('https://brn-ybus-pubapi.sa.cz/restapi/routes/freeSeats', {
           method: 'POST',
@@ -136,20 +209,40 @@ export async function GET(request: Request) {
           body: JSON.stringify({
             sections: [
               {
-                sectionId: SECTION_ID,
+                sectionId: effectiveSectionId,
                 fromStationId: FROM_STATION_ID,
                 toStationId: TO_STATION_ID,
               },
             ],
             seatPreference: {
               seatClass,
-              tariffs: [TARIFF], // 1 cestující, abychom viděli i 1 samostatné volné místo
+              tariffs: [TARIFF],
             },
           }),
           cache: 'no-store',
-        }).then((r) => (r.ok ? r.json() : null))
+        }).then(async (r) => ({ seatClass, status: r.status, body: await r.json() }))
       ),
     ]);
+
+    const debug = searchParams.get('debug') === 'true';
+
+    // Pokud je debug mode, vrátíme rovnou surové odpovědi
+    if (debug) {
+      const detailUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/${effectiveRouteId}/simple?fromStationId=${FROM_STATION_ID}&toStationId=${TO_STATION_ID}&tariffs=${TARIFF}`;
+      const detailRes = await fetch(detailUrl, { headers: COMMON_HEADERS, cache: 'no-store' });
+      const detailBody = await detailRes.json().catch(() => '(nelze parsovat)');
+
+      return NextResponse.json({
+        ok: true,
+        checkedAt: new Date().toLocaleString('cs-CZ', { timeZone: 'Europe/Prague' }),
+        availability,
+        prices,
+        detailEndpoint: { url: detailUrl, status: detailRes.status, body: detailBody },
+        freeSeatsRawResponses: rawResponses,
+      });
+    }
+
+    const responses = rawResponses.map((r) => (r.status >= 200 && r.status < 300 ? r.body : null));
 
     const wagonMap = new Map<
       number,
@@ -225,7 +318,7 @@ export async function GET(request: Request) {
       ? `❌ NEJSOU vedle sebe (ve vlaku jsou volná ${allFreeSingleSeats.length} místa, ale každé jinde).`
       : `❌ NEJSOU vedle sebe (celkem volných míst ve vlaku: ${allFreeSingleSeats.length}).`;
 
-    // Podpis stavu sedadel pro anti-spam (bez cen, aby případná drobná změna nevyvolala falešný poplach)
+    // Podpis stavu sedadel pro anti-spam
     const shouldNotify = areSeatsTogether || (notifyAnyTwo && allFreeSingleSeats.length >= 2);
     const currentSignature = areSeatsTogether
       ? `ADJ:${foundAdjacent.map((f) => f.text).join('|')}`
