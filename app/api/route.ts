@@ -1,9 +1,14 @@
 import { NextResponse } from 'next/server';
 
-// Zde se změní spoj
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
+// Zde změnit spoj
+const ROUTE_ID = '8730781316';
 const SECTION_ID = 8730781316;
 const FROM_STATION_ID = 372825002;
 const TO_STATION_ID = 3741302011;
+const TARIFF = 'CZECH_STUDENT_PASS_26';
 
 const CLASS_NAMES: Record<string, string> = {
   C0: 'Standard',
@@ -12,37 +17,40 @@ const CLASS_NAMES: Record<string, string> = {
   C2: 'Business',
 };
 
-// Paměť proti spamování (aby ti na stejná sedadla nepřišlo 60 mailů za hodinu)
+const COMMON_HEADERS = {
+  'Content-Type': 'application/json',
+  'Accept': 'application/1.2.0+json',
+  'X-Lang': 'cs',
+  'X-Currency': 'CZK',
+  'X-Application-Origin': 'WEB',
+  'Origin': 'https://regiojet.cz',
+  'Referer': 'https://regiojet.cz/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0',
+};
+
+// Paměť proti spamování
 let lastNotifiedSignature = '';
 
-// Přesná mapa sousedních sedadel pro vozy v této soupravě
 function getAdjacentPairsForDeck(deckName: string): [number, number][] {
   const pairs: [number, number][] = [];
 
-  // Velkoprostor 2+2: Astra (Vůz 2) a Bp2xx Low Cost (Vozy 1 a 5)
   if (deckName.includes('Astra') || deckName.includes('Bp2xx')) {
     for (let d = 0; d <= 90; d += 10) {
       pairs.push([d + 1, d + 2], [d + 3, d + 4], [d + 5, d + 6], [d + 7, d + 8]);
     }
     pairs.push([101, 102], [103, 104]);
-  }
-  // Kupé po 6 místech: Vuz Bk Standard (Vozy 3 a 7)
-  else if (deckName.includes('Bk')) {
+  } else if (deckName.includes('Bk')) {
     for (let d = 0; d <= 60; d += 10) {
       pairs.push([d + 1, d + 3], [d + 3, d + 5], [d + 2, d + 4], [d + 4, d + 6]);
     }
-  }
-  // Kupé Business + Relax: Vuz A (Vůz 4)
-  else if (deckName.includes('Vuz A')) {
+  } else if (deckName.includes('Vuz A')) {
     for (let d = 0; d <= 30; d += 10) {
-      pairs.push([d + 1, d + 3], [d + 2, d + 4]); // Business (4 místa)
+      pairs.push([d + 1, d + 3], [d + 2, d + 4]);
     }
     for (let d = 40; d <= 90; d += 10) {
-      pairs.push([d + 1, d + 3], [d + 3, d + 5], [d + 2, d + 4], [d + 4, d + 6]); // Relax (6 míst)
+      pairs.push([d + 1, d + 3], [d + 3, d + 5], [d + 2, d + 4], [d + 4, d + 6]);
     }
-  }
-  // Velkoprostor Relax 2+1: Vuz Bm3xx (Vůz 6)
-  else if (deckName.includes('Bm3xx')) {
+  } else if (deckName.includes('Bm3xx')) {
     for (const d of [0, 10, 30, 40, 70, 80]) {
       pairs.push([d + 1, d + 2], [d + 5, d + 6]);
     }
@@ -55,29 +63,76 @@ function getAdjacentPairsForDeck(deckName: string): [number, number][] {
   return pairs;
 }
 
+// Stažení aktuálních cen pro jednotlivé třídy
+async function fetchClassPrices(): Promise<Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }>> {
+  const priceMap: Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }> = {};
+
+  try {
+    // 1. Zkusíme detail konkrétního spoje (vrací pole priceClasses pro každou třídu)
+    const detailUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/${ROUTE_ID}/simple?fromStationId=${FROM_STATION_ID}&toStationId=${TO_STATION_ID}&tariffs=${TARIFF}`;
+    const res = await fetch(detailUrl, { headers: COMMON_HEADERS, cache: 'no-store' });
+
+    if (res.ok) {
+      const data = await res.json();
+      const priceClasses = data.priceClasses || [];
+      for (const pc of priceClasses) {
+        if (pc.seatClassKey && typeof pc.price === 'number') {
+          priceMap[pc.seatClassKey] = {
+            single: pc.price,
+            totalForTwo: pc.price * 2,
+            creditTotalForTwo: typeof pc.creditPrice === 'number' ? pc.creditPrice * 2 : undefined,
+          };
+        }
+      }
+    }
+
+    // 2. Fallback: Pokud by detail nevrátil priceClasses, vezmeme priceFrom/priceTo z vyhledávání
+    if (Object.keys(priceMap).length === 0) {
+      const searchUrl = `https://brn-ybus-pubapi.sa.cz/restapi/routes/search/simple?tariffs=${TARIFF}&toLocationType=CITY&toLocationId=10202052&fromLocationType=CITY&fromLocationId=372842000&departureDate=2026-11-13`;
+      const sRes = await fetch(searchUrl, { headers: COMMON_HEADERS, cache: 'no-store' });
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        const route = (sData.routes || []).find((r: any) => String(r.id) === ROUTE_ID);
+        if (route && route.priceFrom) {
+          priceMap['FALLBACK'] = {
+            single: route.priceFrom / 1, // Původní dotaz v simple s 1 tarifem vrací cenu za 1 osobu
+            totalForTwo: route.priceFrom * 2,
+            creditTotalForTwo: route.creditPriceFrom ? route.creditPriceFrom * 2 : undefined,
+          };
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Chyba při stahování cen:', e);
+  }
+
+  return priceMap;
+}
+
+function formatPriceText(
+  seatClass: string,
+  prices: Record<string, { single: number; totalForTwo: number; creditTotalForTwo?: number }>
+): string {
+  const p = prices[seatClass] || prices['FALLBACK'];
+  if (!p) return 'cena nezjištěna';
+  const creditPart = p.creditTotalForTwo ? ` (s Kreditovou jízdenkou ${p.creditTotalForTwo} Kč)` : '';
+  return `${p.totalForTwo} Kč za obě jízdenky (${p.single} Kč/os.)${creditPart}`;
+}
+
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    // Pokud dáš do URL ?notifyAnyTwo=true, pošle mail i když budou 2 místa každé jinde
     const notifyAnyTwo = searchParams.get('notifyAnyTwo') === 'true';
 
-    // Zeptáme se API na všechny 4 třídy najednou
     const seatClasses = ['C0', 'TRAIN_LOW_COST', 'C1', 'C2'];
 
-    const responses = await Promise.all(
-      seatClasses.map((seatClass) =>
+    // Paralelně stáhneme sedadla všech 4 tříd + ceník spoje
+    const [prices, ...responses] = await Promise.all([
+      fetchClassPrices(),
+      ...seatClasses.map((seatClass) =>
         fetch('https://brn-ybus-pubapi.sa.cz/restapi/routes/freeSeats', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/1.2.0+json',
-            'X-Lang': 'cs',
-            'X-Currency': 'CZK',
-            'X-Application-Origin': 'WEB',
-            'Origin': 'https://regiojet.cz',
-            'Referer': 'https://regiojet.cz/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0',
-          },
+          headers: COMMON_HEADERS,
           body: JSON.stringify({
             sections: [
               {
@@ -88,13 +143,13 @@ export async function GET(request: Request) {
             ],
             seatPreference: {
               seatClass,
-              tariffs: ['CZECH_STUDENT_PASS_26'],
+              tariffs: [TARIFF], // 1 cestující, abychom viděli i 1 samostatné volné místo
             },
           }),
           cache: 'no-store',
         }).then((r) => (r.ok ? r.json() : null))
-      )
-    );
+      ),
+    ]);
 
     const wagonMap = new Map<
       number,
@@ -132,7 +187,7 @@ export async function GET(request: Request) {
       }
     }
 
-    const foundAdjacent: { isStandard: boolean; text: string }[] = [];
+    const foundAdjacent: { isStandard: boolean; text: string; priceText: string }[] = [];
     const allFreeSingleSeats: string[] = [];
 
     for (const wagon of Array.from(wagonMap.values()).sort((a, b) => a.wagonNumber - b.wagonNumber)) {
@@ -140,7 +195,8 @@ export async function GET(request: Request) {
 
       for (const [seatIndex, info] of wagon.freeSeats.entries()) {
         const cName = CLASS_NAMES[info.seatClass] || info.seatClass;
-        allFreeSingleSeats.push(`Vůz ${wagon.wagonNumber} (třída ${cName}): sedadlo ${seatIndex}`);
+        const pText = formatPriceText(info.seatClass, prices);
+        allFreeSingleSeats.push(`Vůz ${wagon.wagonNumber} (třída ${cName}): sedadlo ${seatIndex} — cena za 2 ks: ${pText}`);
       }
 
       for (const [seatA, seatB] of pairs) {
@@ -149,10 +205,12 @@ export async function GET(request: Request) {
           const className = CLASS_NAMES[infoA.seatClass] || infoA.seatClass;
           const isStandard = infoA.seatClass === 'C0';
           const note = infoA.constraint ? ` (${infoA.constraint})` : '';
+          const priceText = formatPriceText(infoA.seatClass, prices);
 
           foundAdjacent.push({
             isStandard,
-            text: `Třída ${className} | Vůz č. ${wagon.wagonNumber} (${wagon.deckName}) -> sedadla ${seatA} a ${seatB} (VEDLE SEBE)${note}`,
+            priceText,
+            text: `Třída ${className} | Vůz č. ${wagon.wagonNumber} (${wagon.deckName}) -> sedadla ${seatA} a ${seatB} (VEDLE SEBE)${note} | 💰 Cena: ${priceText}`,
           });
         }
       }
@@ -164,10 +222,10 @@ export async function GET(request: Request) {
     const statusSummary = areSeatsTogether
       ? `🎉 ANO! Nalezena místa VEDLE SEBE (${foundAdjacent.length} dvojic).`
       : allFreeSingleSeats.length >= 2
-      ? `❌ NEJSOU vedle sebe (ve vlaku jsou volná ${allFreeSingleSeats.length} místa, ale každé jinde: ${allFreeSingleSeats.join(', ')}).`
+      ? `❌ NEJSOU vedle sebe (ve vlaku jsou volná ${allFreeSingleSeats.length} místa, ale každé jinde).`
       : `❌ NEJSOU vedle sebe (celkem volných míst ve vlaku: ${allFreeSingleSeats.length}).`;
 
-    // Rozhodnutí, zda poslat e-mail
+    // Podpis stavu sedadel pro anti-spam (bez cen, aby případná drobná změna nevyvolala falešný poplach)
     const shouldNotify = areSeatsTogether || (notifyAnyTwo && allFreeSingleSeats.length >= 2);
     const currentSignature = areSeatsTogether
       ? `ADJ:${foundAdjacent.map((f) => f.text).join('|')}`
@@ -178,9 +236,11 @@ export async function GET(request: Request) {
     if (shouldNotify && currentSignature !== lastNotifiedSignature) {
       if (process.env.RESEND_API_KEY && process.env.NOTIFY_EMAIL) {
         const hasStandard = foundAdjacent.some((f) => f.isStandard);
+        const topPrice = foundAdjacent[0]?.priceText || formatPriceText('C0', prices);
+
         const subject = areSeatsTogether
-          ? `${hasStandard ? '⭐ [STANDARD]' : '🚆 [JINÁ TŘÍDA]'} Jsou volná místa VEDLE SEBE (14:05 Vídeň)!`
-          : `⚠️ 2 volná místa ve vlaku (NEJSOU vedle sebe - každé jinde)`;
+          ? `${hasStandard ? '⭐ [STANDARD]' : '🚆 [JINÁ TŘÍDA]'} Volná místa VEDLE SEBE (${topPrice})!`
+          : `⚠️ 2 volná místa ve vlaku (NEJSOU vedle sebe)`;
 
         const emailRes = await fetch('https://api.resend.com/emails', {
           method: 'POST',
@@ -195,12 +255,14 @@ export async function GET(request: Request) {
             html: `
               <h2>Stav sedadel RegioJet (Pátek 13. 11. v 14:05 Pardubice &rarr; Vídeň)</h2>
               <p style="font-size:16px;"><strong>Jsou místa vedle sebe?</strong> ${
-                areSeatsTogether ? '<span style="color:green;font-weight:bold;">ANO!</span>' : '<span style="color:red;font-weight:bold;">NE (každé jinde)</span>'
+                areSeatsTogether
+                  ? '<span style="color:green;font-weight:bold;">ANO!</span>'
+                  : '<span style="color:red;font-weight:bold;">NE (každé jinde)</span>'
               }</p>
               
               ${
                 areSeatsTogether
-                  ? `<h3>Nalezené dvojice VEDLE SEBE:</h3>
+                  ? `<h3>Nalezené dvojice VEDLE SEBE (včetně ceny za 2 jízdenky):</h3>
                      <ul>${foundAdjacent.map((f) => `<li><strong>${f.text}</strong></li>`).join('')}</ul>`
                   : ''
               }
@@ -229,7 +291,6 @@ export async function GET(request: Request) {
         emailStatus = 'missing_env_variables';
       }
     } else if (!shouldNotify) {
-      // Pokud se místa zase obsadí, vynulujeme paměť, aby příště e-mail znovu přišel
       lastNotifiedSignature = '';
     } else {
       emailStatus = 'already_notified_for_these_exact_seats';
@@ -240,6 +301,7 @@ export async function GET(request: Request) {
       checkedAt: new Date().toLocaleString('cs-CZ', { timeZone: 'Europe/Prague' }),
       jsouMistaVedleSebe: areSeatsTogether,
       zprava: statusSummary,
+      cenyZaDveJizdenkyPodleTrid: prices,
       dvojiceVedleSebe: foundAdjacent.map((f) => f.text),
       vsechnaVolnaMistaVeVlaku: allFreeSingleSeats,
       emailStatus,
