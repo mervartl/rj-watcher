@@ -1,8 +1,5 @@
 import { NextResponse } from 'next/server';
 
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
-
 // Tvůj spoj: Pátek 13. 11. 2026, 14:05 Pardubice -> 17:21 Vídeň
 const SECTION_ID = 8730781316;
 const FROM_STATION_ID = 372825002;
