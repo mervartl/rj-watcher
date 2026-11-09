@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-// Tvůj spoj: Pátek 13. 11. 2026, 14:05 Pardubice -> 17:21 Vídeň
+// Zde se změní spoj
 const SECTION_ID = 8730781316;
 const FROM_STATION_ID = 372825002;
 const TO_STATION_ID = 3741302011;
@@ -88,7 +88,7 @@ export async function GET(request: Request) {
             ],
             seatPreference: {
               seatClass,
-              tariffs: ['CZECH_STUDENT_PASS_26', 'CZECH_STUDENT_PASS_26'],
+              tariffs: ['CZECH_STUDENT_PASS_26'],
             },
           }),
           cache: 'no-store',
